@@ -36,12 +36,15 @@ export interface Message {
 
 export type TaskStatus = 'todo' | 'in-progress' | 'blocked' | 'done';
 
+export type TaskCategory = 'Work' | 'Personal' | 'Shopping' | 'Health' | 'Finance' | 'Learning' | 'Other';
+
 export interface Task {
   id: string;
   title: string;
   completed: boolean;
   status: TaskStatus;
   priority: 'low' | 'medium' | 'high';
+  category?: TaskCategory;
   createdAt: number;
   dueDate?: string; // ISO Date string YYYY-MM-DD
   reminderTime?: string; // ISO Date string YYYY-MM-DDTHH:mm

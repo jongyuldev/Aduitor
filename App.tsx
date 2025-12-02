@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Mic, Image as ImageIcon, MapPin, Globe, Zap, Brain, X, Plus, Check, Loader2, Video as VideoIcon, BarChart2, Calendar, ArrowUpDown, Edit2, Bell, AlarmClock, Moon, Sun, Tag, Trash2, AlertTriangle, Flame, Clock, Ban, Settings } from 'lucide-react';
+import { Send, Mic, Image as ImageIcon, MapPin, Globe, Zap, Brain, X, Plus, Check, Loader2, Video as VideoIcon, BarChart2, Calendar, ArrowUpDown, Edit2, Bell, AlarmClock, Moon, Sun, Tag, Trash2, AlertTriangle, Flame, Clock, Ban, Settings, Briefcase, User, ShoppingCart, Heart, DollarSign, BookOpen, Layers, Filter, Pause, Play, Square, GripHorizontal } from 'lucide-react';
 import AduitorCharacter from './components/AduitorCharacter';
 import StatsBoard from './components/StatsBoard';
-import { AduitorState, Message, MessageType, Sender, AIModelMode, Task, ImageGenConfig, TaskStatus, StreakSettings, StreakState } from './types';
+import { AduitorState, Message, MessageType, Sender, AIModelMode, Task, ImageGenConfig, TaskStatus, StreakSettings, StreakState, TaskCategory } from './types';
 import { generateChatResponse, generateGroundedResponse, transcribeAudio, generateImage, generateProactiveSuggestion } from './services/geminiService';
 import * as d3 from 'd3'; 
 
@@ -49,12 +49,23 @@ const getWeeklyKey = (date: Date = new Date()) => {
     return `${year}-W${weekNo}`;
 };
 
+// --- Category Config ---
+const CATEGORY_CONFIG: Record<TaskCategory, { icon: React.ReactNode, color: string }> = {
+    Work: { icon: <Briefcase size={10} />, color: 'text-blue-500' },
+    Personal: { icon: <User size={10} />, color: 'text-purple-500' },
+    Shopping: { icon: <ShoppingCart size={10} />, color: 'text-green-500' },
+    Health: { icon: <Heart size={10} />, color: 'text-red-500' },
+    Finance: { icon: <DollarSign size={10} />, color: 'text-yellow-600' },
+    Learning: { icon: <BookOpen size={10} />, color: 'text-indigo-500' },
+    Other: { icon: <Layers size={10} />, color: 'text-gray-500' },
+};
+
 export default function App() {
   // State
   const [messages, setMessages] = useState<Message[]>([
     {
       id: 'welcome',
-      text: "Hi! I'm Aduitor. It looks like you're starting your day. Would you like some help with that?",
+      text: "Hi! I'm Aduitor. I'm here to help. You can drag me around!",
       sender: Sender.Bot,
       timestamp: Date.now(),
       type: MessageType.Text
@@ -65,13 +76,34 @@ export default function App() {
   const [aduitorState, setAduitorState] = useState<AduitorState>(AduitorState.Idle);
   const [isOpen, setIsOpen] = useState(true);
   const [selectedMode, setSelectedMode] = useState<AIModelMode>(AIModelMode.Chat);
-  const [isRecording, setIsRecording] = useState(false);
   const [attachedFile, setAttachedFile] = useState<{data: string, mimeType: string, name: string} | null>(null);
   const [showStats, setShowStats] = useState(false);
   const [sortBy, setSortBy] = useState<'created' | 'due' | 'priority'>('created');
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [filterCategory, setFilterCategory] = useState<TaskCategory | 'All'>('All');
   const [isDarkMode, setIsDarkMode] = useState(false);
   
+  // Dragging State
+  const [position, setPosition] = useState({ x: 0, y: 0 }); // Initialized in useEffect
+  const [isDragging, setIsDragging] = useState(false);
+  const dragOffset = useRef({ x: 0, y: 0 });
+  const isDragGesture = useRef(false);
+
+  // Audio Recording State
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [audioVisuals, setAudioVisuals] = useState<number[]>(new Array(10).fill(5)); // Visualizer data
+
+  // Refs for Audio
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafIdRef = useRef<number | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const isCancelledRef = useRef(false);
+
   // Streak State & Settings
   const [streakSettings, setStreakSettings] = useState<StreakSettings>(() => {
      try {
@@ -108,12 +140,23 @@ export default function App() {
   const [bursts, setBursts] = useState<Set<string>>(new Set());
   
   // Notification State
-  const [activeNotification, setActiveNotification] = useState<Task | null>(null);
+  const [activeNotifications, setActiveNotifications] = useState<Task[]>([]);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   
   // Image Gen Settings
   const [imgConfig, setImgConfig] = useState<ImageGenConfig>({ size: '1K', aspectRatio: '1:1' });
   const [showImgSettings, setShowImgSettings] = useState(false);
+
+  // Manual Creation State
+  const [isCreating, setIsCreating] = useState(false);
+  const [creationValues, setCreationValues] = useState<{
+      title: string,
+      dueDate: string,
+      priority: 'low' | 'medium' | 'high',
+      category: TaskCategory
+  }>({
+      title: '', dueDate: '', priority: 'medium', category: 'Other'
+  });
 
   // Editing State
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -123,15 +166,68 @@ export default function App() {
       reminderTime: string, 
       priority: 'low' | 'medium' | 'high',
       status: TaskStatus,
-      tags: string
+      tags: string,
+      category: TaskCategory
   }>({
-      title: '', dueDate: '', reminderTime: '', priority: 'medium', status: 'todo', tags: ''
+      title: '', dueDate: '', reminderTime: '', priority: 'medium', status: 'todo', tags: '', category: 'Other'
   });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastProactiveTime = useRef<number>(Date.now());
   const prevCompletedCount = useRef(0);
+
+  // Initialize Position
+  useEffect(() => {
+      // Default to slightly off-center right
+      setPosition({ 
+          x: Math.max(20, window.innerWidth - 450), 
+          y: Math.max(20, window.innerHeight - 650) 
+      });
+  }, []);
+
+  // Drag Logic
+  const handleMouseDown = (e: React.MouseEvent) => {
+      // Allow drag only on left click
+      if (e.button !== 0) return;
+      
+      // Don't drag if interacting with inputs or buttons within the draggable area
+      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'BUTTON' || (e.target as HTMLElement).closest('button')) {
+          return;
+      }
+
+      setIsDragging(true);
+      isDragGesture.current = false;
+      dragOffset.current = {
+          x: e.clientX - position.x,
+          y: e.clientY - position.y
+      };
+  };
+
+  useEffect(() => {
+      const handleMouseMove = (e: MouseEvent) => {
+          if (isDragging) {
+              isDragGesture.current = true;
+              setPosition({
+                  x: e.clientX - dragOffset.current.x,
+                  y: e.clientY - dragOffset.current.y
+              });
+          }
+      };
+
+      const handleMouseUp = () => {
+          setIsDragging(false);
+      };
+
+      if (isDragging) {
+          window.addEventListener('mousemove', handleMouseMove);
+          window.addEventListener('mouseup', handleMouseUp);
+      }
+      return () => {
+          window.removeEventListener('mousemove', handleMouseMove);
+          window.removeEventListener('mouseup', handleMouseUp);
+      };
+  }, [isDragging]);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -187,82 +283,189 @@ export default function App() {
   // Reminder Checker Logic
   useEffect(() => {
       const interval = setInterval(() => {
-          const now = new Date();
           setTasks(prevTasks => {
+              const now = new Date();
+              const firedTasks: Task[] = [];
               let updated = false;
+              
               const newTasks = prevTasks.map(t => {
                   if (t.reminderTime && !t.reminded) {
                       const remTime = new Date(t.reminderTime);
                       if (remTime <= now) {
-                          setActiveNotification(t);
+                          firedTasks.push(t);
                           updated = true;
                           return { ...t, reminded: true };
                       }
                   }
                   return t;
               });
+
+              if (firedTasks.length > 0) {
+                  setTimeout(() => {
+                      setActiveNotifications(prev => {
+                          // Prevent duplicates if interval fires rapidly
+                          const existingIds = new Set(prev.map(p => p.id));
+                          const uniqueNew = firedTasks.filter(f => !existingIds.has(f.id));
+                          return [...prev, ...uniqueNew];
+                      });
+                  }, 0);
+              }
+              
               return updated ? newTasks : prevTasks;
           });
       }, 5000); // Check every 5s
       return () => clearInterval(interval);
   }, []);
 
-  // Audio Recorder Logic
-  const handleMicClick = async () => {
-    if (isRecording) {
-      // Stop logic would go here in a full implementation with MediaRecorder
-      // For this demo, we'll simulate a toggle off
-      setIsRecording(false);
-      setAduitorState(AduitorState.Idle);
-      return;
-    }
+  // --- Audio Recording Logic ---
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setIsRecording(true);
-      setAduitorState(AduitorState.Listening);
+  const startVisualizer = () => {
+      if (!analyserRef.current) return;
+      const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
       
-      const mediaRecorder = new MediaRecorder(stream);
-      const audioChunks: BlobPart[] = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        audioChunks.push(event.data);
-      };
-
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-        const reader = new FileReader();
-        reader.readAsDataURL(audioBlob);
-        reader.onloadend = async () => {
-          const base64Audio = (reader.result as string).split(',')[1];
-          setAduitorState(AduitorState.Thinking);
-          try {
-            const transcription = await transcribeAudio(base64Audio);
-            setInputText(prev => prev + " " + transcription);
-          } catch (e) {
-            console.error(e);
-            addMessage("Sorry, I couldn't hear that clearly.", Sender.Bot);
-          } finally {
-             setAduitorState(AduitorState.Idle);
-             setIsRecording(false);
+      const update = () => {
+          if (!analyserRef.current) return;
+          analyserRef.current.getByteFrequencyData(dataArray);
+          
+          // Sample a few frequencies for the 10 bars
+          const visuals: number[] = [];
+          const step = Math.floor(dataArray.length / 10);
+          for (let i = 0; i < 10; i++) {
+              // Normalize 0-255 to roughly 5-100 for height percent
+              const val = dataArray[i * step];
+              visuals.push(Math.max(10, (val / 255) * 100));
           }
-        };
-        stream.getTracks().forEach(track => track.stop());
+          setAudioVisuals(visuals);
+          rafIdRef.current = requestAnimationFrame(update);
       };
+      update();
+  };
 
-      mediaRecorder.start();
-      // Record for 5 seconds automatically for demo simplicity, or until clicked again
-      setTimeout(() => {
-        if (mediaRecorder.state === 'recording') mediaRecorder.stop();
-      }, 5000);
+  const startRecording = async () => {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+        
+        // Setup Audio Context for Visualizer
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        audioContextRef.current = audioCtx;
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 64; // Low res for retro bars
+        analyserRef.current = analyser;
+        const source = audioCtx.createMediaStreamSource(stream);
+        source.connect(analyser);
+        
+        startVisualizer();
+
+        // Setup Media Recorder
+        const mediaRecorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = mediaRecorder;
+        audioChunksRef.current = [];
+        isCancelledRef.current = false;
+
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                audioChunksRef.current.push(event.data);
+            }
+        };
+
+        mediaRecorder.onstop = async () => {
+             // Cleanup Audio Context
+             if (audioContextRef.current) {
+                 audioContextRef.current.close();
+                 audioContextRef.current = null;
+             }
+             if (rafIdRef.current) {
+                 cancelAnimationFrame(rafIdRef.current);
+                 rafIdRef.current = null;
+             }
+             if (streamRef.current) {
+                 streamRef.current.getTracks().forEach(track => track.stop());
+                 streamRef.current = null;
+             }
+             
+             setIsRecording(false);
+             setIsPaused(false);
+             setAudioVisuals(new Array(10).fill(5)); // Reset visuals
+
+             if (isCancelledRef.current) {
+                 setAduitorState(AduitorState.Idle);
+                 audioChunksRef.current = [];
+                 return;
+             }
+             
+             // Enter Transcribing State
+             setIsTranscribing(true);
+             setAduitorState(AduitorState.Thinking);
+
+             const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
+             const reader = new FileReader();
+             reader.readAsDataURL(audioBlob);
+             reader.onloadend = async () => {
+                const base64Audio = (reader.result as string).split(',')[1];
+                try {
+                    const transcription = await transcribeAudio(base64Audio);
+                    setInputText(prev => (prev ? prev + " " : "") + transcription);
+                } catch (e) {
+                    console.error(e);
+                    addMessage("Sorry, I couldn't hear that clearly.", Sender.Bot);
+                } finally {
+                    setAduitorState(AduitorState.Idle);
+                    setIsTranscribing(false);
+                }
+             };
+        };
+
+        mediaRecorder.start();
+        setIsRecording(true);
+        setIsPaused(false);
+        setAduitorState(AduitorState.Listening);
 
     } catch (err) {
-      console.error("Mic Error:", err);
-      alert("Microphone access denied or error.");
-      setIsRecording(false);
-      setAduitorState(AduitorState.Idle);
+        console.error("Mic Error:", err);
+        alert("Microphone access denied or error.");
+        setIsRecording(false);
+        setAduitorState(AduitorState.Idle);
     }
   };
+
+  const stopRecording = () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+      }
+  };
+
+  const cancelRecording = () => {
+      isCancelledRef.current = true;
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+      } else {
+          setIsRecording(false); // Fallback
+      }
+  };
+
+  const togglePause = () => {
+      if (!mediaRecorderRef.current) return;
+      
+      if (isPaused) {
+          mediaRecorderRef.current.resume();
+          setIsPaused(false);
+          if (audioContextRef.current?.state === 'suspended') {
+              audioContextRef.current.resume();
+          }
+          startVisualizer();
+      } else {
+          mediaRecorderRef.current.pause();
+          setIsPaused(true);
+          if (audioContextRef.current?.state === 'running') {
+              audioContextRef.current.suspend();
+          }
+          if (rafIdRef.current) {
+              cancelAnimationFrame(rafIdRef.current);
+          }
+      }
+  };
+
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -374,9 +577,10 @@ export default function App() {
                   const priority = (call.args.priority as 'low' | 'medium' | 'high') || 'medium';
                   const status = (call.args.status as TaskStatus) || 'todo';
                   const tags = call.args.tags;
-                  addTask(title, dueDate, reminderTime, priority, status, tags);
+                  const category = (call.args.category as TaskCategory) || 'Other';
+                  addTask(title, dueDate, reminderTime, priority, status, tags, category);
                   if (!responseText) {
-                      responseText = `I've added "${title}" to your list${dueDate ? ` (Due: ${dueDate})` : ''}${reminderTime ? ` with a reminder` : ''}${tags ? ` [${tags.join(', ')}]` : ''}.`;
+                      responseText = `I've added "${title}" to your list${dueDate ? ` (Due: ${dueDate})` : ''}${reminderTime ? ` with a reminder` : ''}.`;
                   }
               }
           }
@@ -407,7 +611,15 @@ export default function App() {
   };
 
   // Task Management
-  const addTask = (title: string, dueDate?: string, reminderTime?: string, priority: 'low' | 'medium' | 'high' = 'medium', status: TaskStatus = 'todo', tags: string[] = []) => {
+  const addTask = (
+      title: string, 
+      dueDate?: string, 
+      reminderTime?: string, 
+      priority: 'low' | 'medium' | 'high' = 'medium', 
+      status: TaskStatus = 'todo', 
+      tags: string[] = [],
+      category: TaskCategory = 'Other'
+  ) => {
     if (!title) return;
     const newTask: Task = {
       id: Date.now().toString(),
@@ -419,9 +631,25 @@ export default function App() {
       dueDate: dueDate,
       reminderTime: reminderTime,
       reminded: false,
-      tags: tags
+      tags: tags,
+      category: category
     };
     setTasks(prev => [...prev, newTask]);
+  };
+
+  const handleCreateTask = () => {
+      if (!creationValues.title.trim()) return;
+      addTask(
+          creationValues.title, 
+          creationValues.dueDate || undefined, 
+          undefined, // no reminder for quick add
+          creationValues.priority,
+          'todo',
+          [],
+          creationValues.category
+      );
+      setCreationValues({ title: '', dueDate: '', priority: 'medium', category: 'Other' });
+      setIsCreating(false);
   };
 
   const toggleTask = (id: string) => {
@@ -554,7 +782,8 @@ export default function App() {
         reminderTime: task.reminderTime || '',
         priority: task.priority,
         status: task.status,
-        tags: task.tags ? task.tags.join(', ') : ''
+        tags: task.tags ? task.tags.join(', ') : '',
+        category: task.category || 'Other'
     });
   };
 
@@ -574,7 +803,8 @@ export default function App() {
               priority: editValues.priority,
               status: editValues.status,
               completed: editValues.status === 'done',
-              tags: newTags
+              tags: newTags,
+              category: editValues.category
             } 
           : t
       ));
@@ -585,8 +815,9 @@ export default function App() {
   const uniqueTags = Array.from(new Set(tasks.flatMap(t => t.tags || []))).sort();
   
   const filteredTasks = tasks.filter(t => {
-      if (!selectedTag) return true;
-      return t.tags && t.tags.includes(selectedTag);
+      if (filterCategory !== 'All' && (t.category || 'Other') !== filterCategory) return false;
+      if (selectedTag && (!t.tags || !t.tags.includes(selectedTag))) return false;
+      return true;
   });
   
   const sortedTasks = [...filteredTasks].sort((a, b) => {
@@ -635,7 +866,7 @@ export default function App() {
   const isGoalMet = streak.currentPeriodProgress >= streakSettings.target;
 
   return (
-    <div className="relative w-screen h-screen flex items-center justify-center font-sans">
+    <div className="relative w-screen h-screen font-sans overflow-hidden">
       
       {/* Background Decor (Taskbar placeholder) */}
       <div className={`absolute bottom-0 w-full h-12 border-t-2 border-white/20 flex items-center px-4 shadow-md z-0 ${isDarkMode ? 'bg-slate-800' : 'bg-gray-300'}`}>
@@ -692,26 +923,51 @@ export default function App() {
       )}
 
       {/* Notification Toast */}
-      {activeNotification && (
+      {activeNotifications.length > 0 && (
           <div className="absolute top-4 right-4 z-50 animate-bounce-gentle">
               <div className={`${isDarkMode ? 'bg-yellow-900/90 border-yellow-600 text-yellow-100' : 'bg-yellow-100 border-yellow-400 text-yellow-900'} border-2 rounded-lg shadow-xl p-4 w-72 flex flex-col gap-2`}>
-                  <div className="flex items-center gap-2 font-bold">
-                      <AlarmClock className="animate-pulse text-yellow-500" />
-                      <span>Reminder!</span>
+                  <div className="flex items-center justify-between font-bold">
+                      <div className="flex items-center gap-2">
+                          <AlarmClock className="animate-pulse text-yellow-500" />
+                          <span>{activeNotifications.length} Reminder{activeNotifications.length > 1 ? 's' : ''}!</span>
+                      </div>
+                      {activeNotifications.length > 1 && (
+                          <button onClick={() => setActiveNotifications([])} className="text-xs underline hover:text-yellow-500/80">
+                              Dismiss All
+                          </button>
+                      )}
                   </div>
-                  <p className="text-sm">{activeNotification.title}</p>
+                  
+                  <div className="max-h-40 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+                      {activeNotifications.map(n => (
+                          <div key={n.id} className={`text-sm border-b pb-1 last:border-0 relative group flex justify-between items-start ${isDarkMode ? 'border-yellow-700' : 'border-yellow-200'}`}>
+                              <div>
+                                  <p>{n.title}</p>
+                                  <div className="text-[10px] opacity-75">{new Date(n.reminderTime!).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
+                              </div>
+                              <button 
+                                onClick={() => setActiveNotifications(prev => prev.filter(p => p.id !== n.id))}
+                                className="text-yellow-600 hover:text-red-500 p-0.5"
+                                title="Dismiss"
+                              >
+                                  <X size={12} />
+                              </button>
+                          </div>
+                      ))}
+                  </div>
+
                   <div className="flex justify-end gap-2 mt-2">
                       <button 
-                        onClick={() => setActiveNotification(null)}
-                        className={`text-xs px-2 py-1 rounded border ${isDarkMode ? 'bg-yellow-800 border-yellow-700 hover:bg-yellow-700' : 'bg-yellow-200 border-yellow-300 hover:bg-yellow-300'}`}
+                        onClick={() => setActiveNotifications([])}
+                        className={`text-xs px-2 py-1 rounded border flex-1 font-bold ${isDarkMode ? 'bg-yellow-800 border-yellow-700 hover:bg-yellow-700' : 'bg-yellow-200 border-yellow-300 hover:bg-yellow-300'}`}
                       >
-                        Dismiss
+                        Dismiss All
                       </button>
                       <button 
-                         onClick={() => setActiveNotification(null)}
+                         onClick={() => setActiveNotifications([])}
                          className={`text-xs px-2 py-1 rounded border ${isDarkMode ? 'bg-slate-700 border-slate-600 hover:bg-slate-600' : 'bg-white border-gray-300 hover:bg-gray-50'}`}
                       >
-                         Okay
+                         Close
                       </button>
                   </div>
               </div>
@@ -719,18 +975,24 @@ export default function App() {
       )}
 
       {/* Main Draggable Area Wrapper */}
-      <div className="relative flex flex-col items-end gap-4 z-10 w-full max-w-4xl h-[80vh] pointer-events-none">
+      <div 
+        className="fixed flex flex-col items-end gap-4 z-40 pointer-events-none"
+        style={{ left: position.x, top: position.y }}
+      >
         
         {/* Chat/Task Window */}
         {isOpen && (
           <div className={`pointer-events-auto w-96 border-2 rounded-lg shadow-2xl flex flex-col overflow-hidden animate-bounce-gentle transition-colors duration-300 relative ${windowClass}`} style={{ boxShadow: '10px 10px 0px rgba(0,0,0,0.2)' }}>
             
-            {/* Header */}
-            <div className={`p-2 font-bold flex justify-between items-center select-none transition-colors duration-300 ${headerClass}`}>
+            {/* Header - Drag Handle */}
+            <div 
+                className={`p-2 font-bold flex justify-between items-center select-none transition-colors duration-300 cursor-move ${headerClass}`}
+                onMouseDown={handleMouseDown}
+            >
               <span className="flex items-center gap-2 text-sm">
                   <Brain size={16} /> Aduitor Assistant
               </span>
-              <div className="flex space-x-1 items-center">
+              <div className="flex space-x-1 items-center" onMouseDown={(e) => e.stopPropagation()} style={{cursor: 'default'}}>
                  {/* Streak Display - Clickable */}
                  <button 
                    onClick={() => setShowStreakSettings(!showStreakSettings)}
@@ -842,6 +1104,14 @@ export default function App() {
                    <div className="flex justify-between items-center">
                        <h4 className={`text-xs font-bold uppercase tracking-wider ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>Tasks</h4>
                        <div className="flex items-center gap-2">
+                           <button 
+                             onClick={() => setIsCreating(!isCreating)}
+                             className={`p-1 rounded transition-colors ${isCreating ? (isDarkMode ? 'bg-slate-700 text-blue-400' : 'bg-gray-200 text-blue-600') : (isDarkMode ? 'text-gray-400 hover:bg-slate-700' : 'text-gray-500 hover:bg-gray-200')}`}
+                             title="Quick Add Task"
+                           >
+                               <Plus size={12} />
+                           </button>
+
                            {tasks.some(t => t.completed) && (
                                <button 
                                  onClick={() => setShowClearConfirm(true)}
@@ -851,6 +1121,34 @@ export default function App() {
                                    <Trash2 size={12} />
                                </button>
                            )}
+                           
+                           {/* Category Filter Dropdown */}
+                           <div className="relative group">
+                               <button 
+                                 className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded transition-colors ${isDarkMode ? 'text-purple-300 hover:bg-slate-700' : 'text-purple-600 hover:bg-purple-50'}`}
+                               >
+                                   <Filter size={10} />
+                                   {filterCategory === 'All' ? 'Cat: All' : filterCategory}
+                               </button>
+                               <div className="absolute right-0 top-full mt-1 hidden group-hover:block z-50 w-24 shadow-lg rounded border bg-white dark:bg-slate-800 border-gray-200 dark:border-slate-700">
+                                   <button 
+                                      onClick={() => setFilterCategory('All')} 
+                                      className={`block w-full text-left px-2 py-1 text-[10px] hover:bg-gray-100 dark:hover:bg-slate-700 ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}
+                                   >
+                                       All
+                                   </button>
+                                   {Object.keys(CATEGORY_CONFIG).map((cat) => (
+                                       <button 
+                                          key={cat}
+                                          onClick={() => setFilterCategory(cat as TaskCategory)}
+                                          className={`block w-full text-left px-2 py-1 text-[10px] hover:bg-gray-100 dark:hover:bg-slate-700 ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}
+                                       >
+                                           {cat}
+                                       </button>
+                                   ))}
+                               </div>
+                           </div>
+
                            <button 
                              onClick={() => {
                                  const modes: ('created' | 'due' | 'priority')[] = ['created', 'due', 'priority'];
@@ -876,7 +1174,7 @@ export default function App() {
                                     : (isDarkMode ? 'bg-slate-700 text-gray-400 border-slate-600 hover:bg-slate-600' : 'bg-gray-100 text-gray-500 border-gray-200 hover:bg-gray-200')
                                 }`}
                            >
-                               All
+                               All Tags
                            </button>
                            {uniqueTags.map(tag => (
                                <button 
@@ -895,7 +1193,44 @@ export default function App() {
                    )}
                </div>
 
-               {tasks.length === 0 ? (
+               {/* Manual Creation Form */}
+               {isCreating && (
+                   <div className={`flex flex-col gap-2 p-2 mb-2 rounded animate-in fade-in slide-in-from-top-2 duration-200 border ${isDarkMode ? 'bg-slate-800 border-blue-500' : 'bg-blue-50 border-blue-300'}`}>
+                       <input 
+                         autoFocus
+                         value={creationValues.title}
+                         onChange={e => setCreationValues({...creationValues, title: e.target.value})}
+                         onKeyDown={e => {
+                             if (e.key === 'Enter') handleCreateTask();
+                             if (e.key === 'Escape') setIsCreating(false);
+                         }}
+                         className={`w-full text-sm p-1 border rounded focus:outline-none focus:border-blue-400 ${isDarkMode ? 'bg-slate-700 border-slate-600 text-white' : 'bg-white border-blue-200'}`}
+                         placeholder="New task title..."
+                       />
+                       <div className="flex gap-1 items-center">
+                           <input 
+                             type="date"
+                             value={creationValues.dueDate}
+                             onChange={e => setCreationValues({...creationValues, dueDate: e.target.value})}
+                             className={`flex-1 text-[10px] p-1 border rounded ${isDarkMode ? 'bg-slate-700 border-slate-600 text-white' : 'bg-white border-gray-300 text-gray-600'}`}
+                             title="Due Date"
+                           />
+                           <select
+                                value={creationValues.category}
+                                onChange={e => setCreationValues({...creationValues, category: e.target.value as TaskCategory})}
+                                className={`flex-1 text-[10px] p-1 border rounded ${isDarkMode ? 'bg-slate-700 border-slate-600 text-white' : 'bg-white border-gray-300 text-gray-600'}`}
+                           >
+                               {Object.keys(CATEGORY_CONFIG).map(cat => (
+                                   <option key={cat} value={cat}>{cat}</option>
+                               ))}
+                           </select>
+                           <button onClick={handleCreateTask} className="p-1 bg-blue-600 text-white rounded hover:bg-blue-700"><Check size={12}/></button>
+                           <button onClick={() => setIsCreating(false)} className="p-1 bg-gray-500 text-white rounded hover:bg-gray-600"><X size={12}/></button>
+                       </div>
+                   </div>
+               )}
+
+               {tasks.length === 0 && !isCreating ? (
                    <div className={`text-xs text-center py-2 ${isDarkMode ? 'text-gray-500' : 'text-gray-400'}`}>No tasks. Ask me to add one!</div>
                ) : (
                    <ul className="space-y-1">
@@ -923,6 +1258,20 @@ export default function App() {
                                             className={`flex-1 text-[10px] p-1 border rounded ${isDarkMode ? 'bg-slate-700 border-slate-600 text-white' : 'bg-white border-gray-300 text-gray-600'}`}
                                             placeholder="Tags (comma separated)..."
                                         />
+                                   </div>
+                                   
+                                   {/* Category Selector */}
+                                   <div className="flex items-center gap-1">
+                                       <span className="text-[9px] text-gray-400 w-12">Category:</span>
+                                       <select
+                                            value={editValues.category}
+                                            onChange={e => setEditValues({...editValues, category: e.target.value as TaskCategory})}
+                                            className={`flex-1 text-[10px] p-1 border rounded ${isDarkMode ? 'bg-slate-700 border-slate-600 text-white' : 'bg-white border-gray-300 text-gray-600'}`}
+                                       >
+                                           {Object.keys(CATEGORY_CONFIG).map(cat => (
+                                               <option key={cat} value={cat}>{cat}</option>
+                                           ))}
+                                       </select>
                                    </div>
 
                                    <div className="flex flex-col gap-1">
@@ -997,6 +1346,11 @@ export default function App() {
                                                : (isDarkMode ? 'text-gray-300' : 'text-gray-700')
                                        }`}>{t.title}</span>
                                        
+                                       {/* Category Icon */}
+                                       <div className={`p-1 rounded-full ${t.category ? CATEGORY_CONFIG[t.category].color : 'text-gray-400'} bg-opacity-10`} title={t.category}>
+                                            {t.category ? CATEGORY_CONFIG[t.category].icon : <Layers size={10} />}
+                                       </div>
+
                                        {/* Status Badge - Click to Cycle */}
                                        <button
                                           onClick={(e) => { e.stopPropagation(); cycleStatus(t.id); }}
@@ -1065,100 +1419,95 @@ export default function App() {
 
             {/* Input Area */}
             <div className={`p-2 border-t transition-colors duration-300 ${inputAreaClass}`}>
-               {attachedFile && (
-                   <div className={`flex items-center justify-between text-xs px-2 py-1 mb-2 rounded border ${isDarkMode ? 'bg-blue-900/50 text-blue-200 border-blue-800' : 'bg-blue-100 text-blue-800 border-blue-200'}`}>
-                       <span className="truncate max-w-[200px]">{attachedFile.name}</span>
-                       <button onClick={() => setAttachedFile(null)}><X size={12}/></button>
-                   </div>
-               )}
-               <div className="flex items-end gap-2">
-                 <button 
-                    className={`p-2 rounded-full transition-colors ${isDarkMode ? 'text-gray-400 hover:text-gray-200 hover:bg-slate-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-200'}`}
-                    onClick={() => fileInputRef.current?.click()}
-                 >
-                    <Plus size={18} />
-                 </button>
-                 <input 
+              {/* File Preview */}
+              {attachedFile && (
+                  <div className={`flex items-center justify-between p-1 mb-1 text-xs rounded border ${isDarkMode ? 'bg-slate-700 border-slate-600' : 'bg-gray-100 border-gray-200'}`}>
+                      <span className="truncate max-w-[150px]">{attachedFile.name}</span>
+                      <button onClick={() => setAttachedFile(null)} className="hover:text-red-500"><X size={12}/></button>
+                  </div>
+              )}
+
+              <div className="flex items-center gap-2">
+                  <input 
                     type="file" 
                     ref={fileInputRef} 
                     className="hidden" 
                     onChange={handleFileUpload} 
                     accept="image/*,video/*"
-                 />
-                 
-                 <textarea
-                    value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
-                    onKeyDown={(e) => {
-                        if (e.key === 'Enter' && !e.shiftKey) {
-                            e.preventDefault();
-                            handleSend();
-                        }
-                    }}
-                    placeholder={isRecording ? "Listening..." : "How can I help you?"}
-                    className={`flex-1 rounded-lg p-2 text-sm focus:outline-none focus:ring-1 resize-none h-10 max-h-24 ${inputFieldClass}`}
-                    disabled={isRecording || aduitorState === AduitorState.Thinking}
-                 />
+                  />
+                  <button 
+                    onClick={() => fileInputRef.current?.click()} 
+                    className={`p-2 rounded-full transition-colors ${isDarkMode ? 'hover:bg-slate-700 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
+                    title="Attach Image/Video"
+                  >
+                      <ImageIcon size={18} />
+                  </button>
 
-                 <button
-                   onClick={handleMicClick}
-                   className={`p-2 rounded-full transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : (isDarkMode ? 'text-gray-400 hover:bg-slate-700' : 'text-gray-500 hover:bg-gray-200')}`}
-                 >
-                    <Mic size={18} />
-                 </button>
+                  <div className="flex-1 relative">
+                      <textarea
+                        value={inputText}
+                        onChange={e => setInputText(e.target.value)}
+                        onKeyDown={e => {
+                            if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                handleSend();
+                            }
+                        }}
+                        placeholder={isRecording ? "Listening..." : "Type a message..."}
+                        className={`w-full max-h-24 py-2 px-3 pr-10 rounded-2xl resize-none text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 ${inputFieldClass}`}
+                        rows={1}
+                      />
+                  </div>
 
-                 <button 
-                   onClick={handleSend}
-                   disabled={(!inputText && !attachedFile) || aduitorState === AduitorState.Thinking}
-                   className="p-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm active:scale-95 transition-transform"
-                 >
-                    <Send size={16} />
-                 </button>
-               </div>
+                  {inputText.trim() || attachedFile ? (
+                      <button 
+                        onClick={handleSend}
+                        className="p-2 bg-blue-600 text-white rounded-full hover:bg-blue-700 transition-transform active:scale-95"
+                      >
+                          <Send size={18} />
+                      </button>
+                  ) : (
+                      <button 
+                         onMouseDown={startRecording}
+                         onMouseUp={stopRecording}
+                         onMouseLeave={stopRecording}
+                         className={`p-2 rounded-full transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : (isDarkMode ? 'bg-slate-700 text-gray-400 hover:bg-slate-600' : 'bg-gray-200 text-gray-600 hover:bg-gray-300')}`}
+                      >
+                          {isRecording ? <div className="w-4 h-4 bg-white rounded-sm" /> : <Mic size={18} />}
+                      </button>
+                  )}
+              </div>
+              
+              {/* Visualizer for Audio */}
+              {isRecording && (
+                   <div className="flex justify-center items-end gap-0.5 h-8 mt-2">
+                       {audioVisuals.map((h, i) => (
+                           <div key={i} className="w-1 bg-red-500 rounded-t" style={{ height: `${h}%`, transition: 'height 0.1s' }}></div>
+                       ))}
+                   </div>
+              )}
             </div>
-
-            {/* Confirmation Modal */}
-            {showClearConfirm && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-                    <div className={`p-4 rounded-lg shadow-xl border w-64 animate-in fade-in zoom-in-95 duration-200 ${isDarkMode ? 'bg-slate-800 border-slate-600' : 'bg-white border-gray-300'}`}>
-                        <div className="flex items-center gap-2 mb-3 text-red-500 font-bold">
-                            <AlertTriangle size={20} />
-                            <span>Clear Completed?</span>
-                        </div>
-                        <p className={`text-xs mb-4 ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>
-                            Are you sure you want to remove all completed tasks? This cannot be undone.
-                        </p>
-                        <div className="flex justify-end gap-2">
-                            <button 
-                                onClick={() => setShowClearConfirm(false)}
-                                className={`px-3 py-1.5 rounded text-xs border ${isDarkMode ? 'border-slate-600 text-gray-300 hover:bg-slate-700' : 'border-gray-300 text-gray-600 hover:bg-gray-100'}`}
-                            >
-                                Cancel
-                            </button>
-                            <button 
-                                onClick={clearCompletedTasks}
-                                className="px-3 py-1.5 rounded text-xs bg-red-500 text-white hover:bg-red-600 border border-red-600"
-                            >
-                                Clear All
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
           </div>
-        )}
+          
+          {/* Character */}
+          <div 
+             className="pointer-events-auto cursor-move active:cursor-grabbing mb-8"
+             onMouseDown={handleMouseDown}
+          >
+              <AduitorCharacter 
+                 state={aduitorState} 
+                 onClick={() => {
+                     if (!isDragGesture.current) {
+                        setIsOpen(prev => !prev);
+                        setAduitorState(AduitorState.Surprised);
+                        setTimeout(() => setAduitorState(AduitorState.Idle), 1000);
+                     }
+                 }} 
+                 isDarkMode={isDarkMode}
+              />
+          </div>
 
-        {/* The Character (Click to toggle visibility of chat) */}
-        <div className="pointer-events-auto flex justify-end pr-8">
-            <AduitorCharacter 
-                state={aduitorState} 
-                onClick={() => setIsOpen(prev => !prev)}
-                className="w-24 h-24"
-                isDarkMode={isDarkMode}
-            />
-        </div>
       </div>
-
     </div>
   );
 }

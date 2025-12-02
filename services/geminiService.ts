@@ -20,6 +20,11 @@ const addTaskTool: FunctionDeclaration = {
         type: Type.STRING,
         description: "The content of the task."
       },
+      category: {
+        type: Type.STRING,
+        description: "The category of the task. Infer this from the content.",
+        enum: ['Work', 'Personal', 'Shopping', 'Health', 'Finance', 'Learning', 'Other']
+      },
       dueDate: {
         type: Type.STRING,
         description: "The due date of the task in YYYY-MM-DD format. If the user says 'tomorrow' or 'next monday', calculate the date based on the current date.",
@@ -41,7 +46,7 @@ const addTaskTool: FunctionDeclaration = {
       tags: {
         type: Type.ARRAY,
         items: { type: Type.STRING },
-        description: "List of tags or categories associated with the task (e.g., 'work', 'personal', 'shopping', 'project'). Extract these from context if possible."
+        description: "List of tags or categories associated with the task (e.g., 'urgent', 'groceries', 'project-x'). Extract these from context if possible."
       }
     },
     required: ["title"]
